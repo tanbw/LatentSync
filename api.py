@@ -2,8 +2,8 @@ import os
 import uuid
 from pathlib import Path
 from datetime import datetime
-from fastapi import FastAPI, File,Form, UploadFile, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
 from omegaconf import OmegaConf
 import argparse
 import gc
@@ -13,6 +13,10 @@ import sys
 import logging
 import threading
 import queue
+import asyncio
+from typing import Dict, Optional
+from enum import Enum
+import json
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,6 +28,16 @@ CHECKPOINT_PATH = Path("checkpoints/latentsync_unet.pt")
 PROJECT_ROOT = Path(__file__).parent.absolute()
 OUTPUT_DIR = PROJECT_ROOT / "temp"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# 任务状态存储
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+# 全局任务存储
+tasks: Dict[str, dict] = {}
 
 app = FastAPI(
     title="LatentSync Video Generation API",
@@ -211,20 +225,65 @@ def generate_video_sync(
         logger.error(f"视频生成失败: {str(e)}")
         return False, None
 
+async def run_video_generation(task_id: str, video_path: str, audio_path: str, 
+                              guidance_scale: float, inference_steps: int, seed: int):
+    """异步运行视频生成任务"""
+    try:
+        # 更新任务状态为处理中
+        tasks[task_id]["status"] = TaskStatus.PROCESSING
+        tasks[task_id]["start_time"] = datetime.now().isoformat()
+        
+        # 在线程池中运行同步任务
+        loop = asyncio.get_event_loop()
+        success, result_path = await loop.run_in_executor(
+            None, generate_video_sync, video_path, audio_path, guidance_scale, inference_steps, seed
+        )
+        
+        # 更新任务状态
+        if success and result_path:
+            tasks[task_id]["status"] = TaskStatus.COMPLETED
+            tasks[task_id]["result_path"] = result_path
+            tasks[task_id]["end_time"] = datetime.now().isoformat()
+            logger.info(f"任务 {task_id} 完成，结果路径: {result_path}")
+        else:
+            tasks[task_id]["status"] = TaskStatus.FAILED
+            tasks[task_id]["end_time"] = datetime.now().isoformat()
+            tasks[task_id]["error"] = "视频生成失败"
+            logger.error(f"任务 {task_id} 失败")
+            
+    except Exception as e:
+        tasks[task_id]["status"] = TaskStatus.FAILED
+        tasks[task_id]["end_time"] = datetime.now().isoformat()
+        tasks[task_id]["error"] = str(e)
+        logger.error(f"任务 {task_id} 执行异常: {str(e)}")
+
 from urllib.parse import unquote
 from pathlib import Path
 @app.post("/generate")
 async def generate_video(
+    background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
     audio: UploadFile = File(...),
-    guidance_scale: float = Form(),
-    inference_steps: int = Form(),
-    seed: int = Form()
+    guidance_scale: float = Form(1.5),
+    inference_steps: int = Form(20),
+    seed: int = Form(1247)
 ):
-    """同步生成视频接口，阻塞直到完成"""
+    """异步生成视频接口，立即返回任务ID"""
+    task_id = str(uuid.uuid4())
+    
+    # 初始化任务状态
+    tasks[task_id] = {
+        "status": TaskStatus.PENDING,
+        "create_time": datetime.now().isoformat(),
+        "video_filename": video.filename,
+        "audio_filename": audio.filename,
+        "guidance_scale": guidance_scale,
+        "inference_steps": inference_steps,
+        "seed": seed
+    }
+    
     try:
         # 创建临时目录
-        task_id = str(uuid.uuid4())
         temp_dir = PROJECT_ROOT / "uploads" / task_id
         
         # 确保使用绝对路径
@@ -234,13 +293,9 @@ async def generate_video(
             temp_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             logger.error(f"无法创建临时目录 {temp_dir}: {str(e)}")
+            tasks[task_id]["status"] = TaskStatus.FAILED
+            tasks[task_id]["error"] = "无法创建临时目录"
             raise HTTPException(status_code=500, detail="无法创建临时目录")
-
-        # 打印调试信息
-        logger.info(f"guidance_scale:  {guidance_scale}")
-        logger.info(f"inference_steps: {inference_steps}")
-        logger.info(f"临时目录路径: {temp_dir}")
-        logger.info(f"目录是否存在: {temp_dir.exists()}")
 
         # 处理文件名 - 移除特殊字符
         def sanitize_filename(filename: str) -> str:
@@ -269,75 +324,125 @@ async def generate_video(
                 logger.info(f"已保存音频文件 {audio_path} ({len(content)} bytes)")
         except Exception as e:
             logger.error(f"文件保存失败: {str(e)}")
+            tasks[task_id]["status"] = TaskStatus.FAILED
+            tasks[task_id]["error"] = "文件保存失败"
             raise HTTPException(status_code=500, detail="文件保存失败")
 
         # 检查文件是否确实存在
         if not video_path.exists():
             logger.error(f"视频文件不存在: {video_path}")
+            tasks[task_id]["status"] = TaskStatus.FAILED
+            tasks[task_id]["error"] = "视频文件不存在"
             raise HTTPException(status_code=500, detail="视频文件保存后不存在")
         if not audio_path.exists():
             logger.error(f"音频文件不存在: {audio_path}")
+            tasks[task_id]["status"] = TaskStatus.FAILED
+            tasks[task_id]["error"] = "音频文件不存在"
             raise HTTPException(status_code=500, detail="音频文件保存后不存在")
 
-        # 打印完整路径
-        logger.info(f"视频文件完整路径: {video_path.absolute()}")
-        logger.info(f"音频文件完整路径: {audio_path.absolute()}")
-
-        # 同步执行视频生成
-        logger.info(f"开始同步生成视频，任务ID: {task_id}")
-        success, result_path = generate_video_sync(
-            str(video_path.absolute()),  # 使用绝对路径
+        # 更新任务信息
+        tasks[task_id]["video_path"] = str(video_path.absolute())
+        tasks[task_id]["audio_path"] = str(audio_path.absolute())
+        
+        # 添加后台任务
+        background_tasks.add_task(
+            run_video_generation, 
+            task_id, 
+            str(video_path.absolute()),
             str(audio_path.absolute()),
             guidance_scale,
             inference_steps,
             seed
         )
         
-        if not success or not result_path:
-            # 清理上传的文件
-           # try:
-                # for file in temp_dir.glob("*"):
-               #     file.unlink()
-                # temp_dir.rmdir()
-          #  except Exception as e:
-          #      logger.error(f"清理临时文件失败: {str(e)}")
-            
-            raise HTTPException(
-                status_code=500, 
-                detail="视频生成失败，请检查日志获取详细信息"
-            )
+        logger.info(f"已启动后台任务，任务ID: {task_id}")
         
-        return FileResponse(
-            result_path,
-            media_type="video/mp4",
-            filename=Path(result_path).name,
-            headers={"X-Task-ID": task_id}
+        return JSONResponse(
+            status_code=202,
+            content={
+                "message": "视频生成任务已开始处理",
+                "task_id": task_id,
+                "status_url": f"/task/{task_id}",
+                "download_url": f"/download/{task_id}"
+            }
         )
-    except HTTPException:
-        raise
+        
     except Exception as e:
         logger.error(f"视频生成请求处理失败: {str(e)}", exc_info=True)
+        if task_id in tasks:
+            tasks[task_id]["status"] = TaskStatus.FAILED
+            tasks[task_id]["error"] = str(e)
         raise HTTPException(
             status_code=500, 
             detail=f"视频生成请求处理失败: {str(e)}"
         )
+
+@app.get("/task/{task_id}")
+async def get_task_status(task_id: str):
+    """查询任务状态"""
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    
+    task_info = tasks[task_id].copy()
+    
+    # 移除可能过大的字段
+    for key in ["video_path", "audio_path", "result_path"]:
+        if key in task_info:
+            task_info[key] = "已设置" if task_info[key] else "未设置"
+    
+    return task_info
+
+@app.get("/download/{task_id}")
+async def download_video(task_id: str):
+    """下载生成的视频文件"""
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    
+    task = tasks[task_id]
+    
+    if task["status"] != TaskStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="任务未完成或失败")
+    
+    if "result_path" not in task or not task["result_path"]:
+        raise HTTPException(status_code=500, detail="任务结果路径不存在")
+    
+    result_path = Path(task["result_path"])
+    if not result_path.exists():
+        raise HTTPException(status_code=404, detail="生成的文件不存在")
+    
+    filename = f"generated_{task_id}{result_path.suffix}"
+    
+    return FileResponse(
+        result_path,
+        media_type="video/mp4",
+        filename=filename,
+        headers={"X-Task-ID": task_id}
+    )
 
 @app.get("/cleanup/{task_id}")
 async def cleanup_task(task_id: str):
     """清理任务生成的文件"""
     try:
         # 清理上传的文件
-        upload_dir = OUTPUT_DIR / "uploads" / task_id
-        if upload_dir.exists():
+        upload_dir = PROJECT_ROOT / "uploads" / task_id
+        if upload_dir.exists() and upload_dir.is_dir():
             for file in upload_dir.glob("*"):
                 file.unlink()
             upload_dir.rmdir()
             logger.info(f"清理上传文件: {upload_dir}")
         
-        # 清理生成的视频文件（由客户端决定是否保留）
-        # 这里不自动清理生成的视频文件，因为可能还需要使用
+        # 清理生成的视频文件
+        if task_id in tasks and "result_path" in tasks[task_id]:
+            result_path = Path(tasks[task_id]["result_path"])
+            if result_path.exists():
+                result_path.unlink()
+                logger.info(f"清理生成文件: {result_path}")
         
-        return {"status": "success", "message": f"清理任务 {task_id} 的上传文件"}
+        # 从任务列表中移除
+        if task_id in tasks:
+            del tasks[task_id]
+        
+        return {"status": "success", "message": f"清理任务 {task_id} 的文件完成"}
     except Exception as e:
         logger.error(f"清理任务失败: {str(e)}")
         raise HTTPException(
@@ -347,4 +452,4 @@ async def cleanup_task(task_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000,timeout_keep_alive=7200)
+    uvicorn.run(app, host="0.0.0.0", port=8000, timeout_keep_alive=7200)

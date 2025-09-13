@@ -1,5 +1,4 @@
-# 使用 NVIDIA CUDA 12.6 基础镜像 + Ubuntu 22.04
-FROM nvidia/cuda:12.1.0-devel-ubuntu22.04
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
 
 # 设置环境变量
 ARG VENV_NAME="latentsync"
@@ -10,7 +9,6 @@ ENV DEBIAN_FRONTEN=noninteractive
 ENV PYTHONUNBUFFERED=1
 SHELL ["/bin/bash", "--login", "-c"]
 
-# 安装系统依赖（包括 Conda 所需的工具和 OpenCV 的库）
 RUN apt-get update -y --fix-missing && apt-get install -y --no-install-recommends \
     wget \
     git \
@@ -19,8 +17,7 @@ RUN apt-get update -y --fix-missing && apt-get install -y --no-install-recommend
     libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装特定版本的Miniconda（避免自动使用Python 3.13）
-RUN wget --quiet https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O ~/miniforge.sh && \
+RUN wget --quiet https://ghfast.top/github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O ~/miniforge.sh && \
     /bin/bash ~/miniforge.sh -b -p /opt/conda && \
     rm ~/miniforge.sh && \
     ln -s /opt/conda/etc/profile.d/conda.sh /etc/profile.d/conda.sh && \
@@ -41,17 +38,17 @@ ENV CONDA_DEFAULT_ENV=${VENV}
 ENV PATH /opt/conda/bin:/opt/conda/envs/${VENV}/bin:$PATH
 
 WORKDIR /workspace
-RUN git clone https://github.com/bytedance/LatentSync.git && \
+RUN git clone https://ghfast.top/github.com/tanbw/LatentSync.git && \
     cd LatentSync && \
     git submodule update --init --recursive
 
-# 关键修改：精确指定所有版本并锁定Python 3.9
 WORKDIR /workspace/LatentSync
 RUN conda activate ${VENV} && conda install -y -c conda-forge ffmpeg
-RUN conda activate ${VENV} && pip install -r requirements.txt
+RUN conda activate ${VENV} && pip config set global.index-url https://mirrors.ustc.edu.cn/pypi/simple/ && \
+ pip install -r requirements.txt && pip install huggingface_hub[hf_xet]
 
 # 暴露 Gradio 默认端口
 EXPOSE 7860
-
+COPY ./api.py /workspace/LatentSync/api.py
 # 启动命令：激活 Conda 环境后运行 Gradio 应用
-CMD ["/bin/bash", "-c", "source ~/.bashrc && python gradio_app.py"]
+CMD ["/bin/bash", "-c", "source ~/.bashrc && python api.py"]
