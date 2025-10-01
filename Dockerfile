@@ -44,7 +44,7 @@ RUN git clone https://ghfast.top/github.com/tanbw/LatentSync.git && \
 
 WORKDIR /workspace/LatentSync
 RUN conda activate ${VENV} && conda install -y -c conda-forge ffmpeg
-RUN conda activate ${VENV} && pip config set global.index-url https://mirrors.ustc.edu.cn/pypi/simple/ && \
+RUN conda activate ${VENV}  && \
  pip install -r requirements.txt && pip install huggingface_hub[hf_xet]
 
 # 暴露 Gradio 默认端口
